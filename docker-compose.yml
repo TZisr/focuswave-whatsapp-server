@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  whatsapp-server:
+    build: .
+    ports:
+      - "3001:3001"
+    volumes:
+      # Persist WhatsApp session across restarts
+      - whatsapp-session:/app/whatsapp-session
+    environment:
+      - PORT=3001
+    restart: unless-stopped
+
+volumes:
+  whatsapp-session:
