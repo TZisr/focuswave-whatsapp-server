@@ -2,11 +2,12 @@ const express = require('express');
 const cors = require('cors');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// CORS - allow all origins (configure for production)
+// CORS - allow all origins
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -22,43 +23,65 @@ let isInitializing = true;
 let initError = null;
 let clientInfo = null;
 
-// Get Chromium path from environment or use default
-const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || 
-                      process.env.CHROMIUM_PATH || 
-                      '/usr/bin/chromium';
+// Find Chromium - Puppeteer image has it pre-installed
+const possiblePaths = [
+  process.env.PUPPETEER_EXECUTABLE_PATH,
+  '/usr/bin/google-chrome-stable',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser'
+].filter(Boolean);
 
-console.log('🌐 Using Chromium at:', CHROMIUM_PATH);
+let CHROMIUM_PATH = null;
+for (const p of possiblePaths) {
+  try {
+    if (fs.existsSync(p)) {
+      CHROMIUM_PATH = p;
+      break;
+    }
+  } catch (e) {
+    // Ignore errors
+  }
+}
 
-// Initialize WhatsApp client with local session storage
+console.log('🌐 Chromium path:', CHROMIUM_PATH || 'Using Puppeteer default');
+
+// Build puppeteer options
+const puppeteerOptions = {
+  headless: true,
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-accelerated-2d-canvas',
+    '--no-first-run',
+    '--no-zygote',
+    '--single-process',
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    '--disable-background-networking',
+    '--disable-default-apps',
+    '--disable-extensions',
+    '--disable-sync',
+    '--disable-translate',
+    '--hide-scrollbars',
+    '--metrics-recording-only',
+    '--mute-audio',
+    '--no-default-browser-check',
+    '--safebrowsing-disable-auto-update'
+  ]
+};
+
+// Only set executablePath if we found a specific one
+if (CHROMIUM_PATH) {
+  puppeteerOptions.executablePath = CHROMIUM_PATH;
+}
+
+// Initialize WhatsApp client
 const client = new Client({
   authStrategy: new LocalAuth({
     dataPath: './whatsapp-session'
   }),
-  puppeteer: {
-    headless: true,
-    executablePath: CHROMIUM_PATH,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-gpu',
-      '--disable-software-rasterizer',
-      '--disable-background-networking',
-      '--disable-default-apps',
-      '--disable-extensions',
-      '--disable-sync',
-      '--disable-translate',
-      '--hide-scrollbars',
-      '--metrics-recording-only',
-      '--mute-audio',
-      '--no-default-browser-check',
-      '--safebrowsing-disable-auto-update'
-    ]
-  }
+  puppeteer: puppeteerOptions
 });
 
 // Event handlers
@@ -66,19 +89,15 @@ client.on('qr', async (qr) => {
   console.log('📱 QR Code generated - scan with WhatsApp');
   isInitializing = false;
   try {
-    // Generate QR code as data URL for frontend display
     currentQR = await QRCode.toDataURL(qr, {
       width: 256,
       margin: 2,
-      color: {
-        dark: '#000000',
-        light: '#FFFFFF'
-      }
+      color: { dark: '#000000', light: '#FFFFFF' }
     });
     console.log('✅ QR Code ready for scanning');
   } catch (err) {
     console.error('❌ QR generation error:', err);
-    currentQR = qr; // Fallback to raw string
+    currentQR = qr;
   }
 });
 
@@ -108,7 +127,6 @@ client.on('disconnected', (reason) => {
   console.log('🔌 Client disconnected:', reason);
   isConnected = false;
   clientInfo = null;
-  // Try to reinitialize after disconnect
   setTimeout(() => {
     console.log('🔄 Attempting to reinitialize...');
     client.initialize().catch(err => {
@@ -121,7 +139,7 @@ client.on('loading_screen', (percent, message) => {
   console.log(`⏳ Loading: ${percent}% - ${message}`);
 });
 
-// Initialize client with better error handling
+// Initialize client
 console.log('🚀 Starting WhatsApp client...');
 client.initialize()
   .then(() => {
@@ -135,9 +153,7 @@ client.initialize()
 
 // Routes
 
-// GET /status - Connection status
 app.get('/status', (req, res) => {
-  console.log('📡 Status check - connected:', isConnected, 'initializing:', isInitializing);
   res.json({
     connected: isConnected,
     authenticated: isConnected,
@@ -151,17 +167,12 @@ app.get('/status', (req, res) => {
   });
 });
 
-// GET /qr - Get QR code for scanning
 app.get('/qr', (req, res) => {
-  console.log('📱 QR requested - connected:', isConnected, 'hasQR:', !!currentQR, 'initializing:', isInitializing);
-  
   if (isConnected) {
-    console.log('📱 Already connected');
     return res.json({ connected: true, qr: null });
   }
   
   if (initError) {
-    console.log('📱 Init error:', initError);
     return res.status(500).json({ 
       error: 'Client initialization failed',
       message: initError
@@ -169,7 +180,6 @@ app.get('/qr', (req, res) => {
   }
   
   if (!currentQR) {
-    console.log('📱 QR not ready yet, initializing:', isInitializing);
     return res.status(503).json({ 
       error: 'QR code not available yet',
       message: isInitializing ? 'WhatsApp client is starting up...' : 'Please wait for the QR code to be generated',
@@ -177,11 +187,9 @@ app.get('/qr', (req, res) => {
     });
   }
   
-  console.log('📱 Serving QR code');
   res.json({ qr: currentQR });
 });
 
-// GET /chats - Get all chats with recent messages
 app.get('/chats', async (req, res) => {
   if (!isConnected) {
     return res.status(503).json({ 
@@ -191,7 +199,6 @@ app.get('/chats', async (req, res) => {
   }
 
   try {
-    console.log('📋 Fetching chats...');
     const chats = await client.getChats();
     
     const formattedChats = await Promise.all(
@@ -219,7 +226,6 @@ app.get('/chats', async (req, res) => {
             }))
           };
         } catch (err) {
-          console.error(`Error fetching messages for chat ${chat.name}:`, err.message);
           return {
             id: chat.id._serialized,
             name: chat.name || 'Unknown',
@@ -231,15 +237,12 @@ app.get('/chats', async (req, res) => {
       })
     );
 
-    console.log(`✅ Returning ${formattedChats.length} chats`);
     res.json({ chats: formattedChats });
   } catch (err) {
-    console.error('❌ Error fetching chats:', err);
     res.status(500).json({ error: 'Failed to fetch chats', message: err.message });
   }
 });
 
-// GET /chats/:id/messages - Get messages for specific chat
 app.get('/chats/:chatId/messages', async (req, res) => {
   if (!isConnected) {
     return res.status(503).json({ error: 'WhatsApp not connected' });
@@ -265,12 +268,10 @@ app.get('/chats/:chatId/messages', async (req, res) => {
       }))
     });
   } catch (err) {
-    console.error('❌ Error fetching messages:', err);
     res.status(500).json({ error: 'Failed to fetch messages', message: err.message });
   }
 });
 
-// POST /disconnect - Disconnect the client
 app.post('/disconnect', async (req, res) => {
   try {
     await client.logout();
@@ -280,7 +281,6 @@ app.post('/disconnect', async (req, res) => {
   }
 });
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -297,7 +297,6 @@ app.listen(PORT, '0.0.0.0', () => {
 ║         FocusWave WhatsApp Server                         ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  Server running on port ${PORT}                              ║
-║  Chromium: ${CHROMIUM_PATH.substring(0, 40).padEnd(40)}   ║
 ║  Endpoints:                                               ║
 ║    GET  /status  - Connection status                      ║
 ║    GET  /qr      - QR code for scanning                   ║
@@ -308,23 +307,14 @@ app.listen(PORT, '0.0.0.0', () => {
   `);
 });
 
-// Graceful shutdown
 process.on('SIGINT', async () => {
-  console.log('\n🛑 Shutting down gracefully...');
-  try {
-    await client.destroy();
-  } catch (err) {
-    console.error('Error during shutdown:', err);
-  }
+  console.log('\n🛑 Shutting down...');
+  try { await client.destroy(); } catch (e) {}
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  console.log('\n🛑 SIGTERM received, shutting down...');
-  try {
-    await client.destroy();
-  } catch (err) {
-    console.error('Error during shutdown:', err);
-  }
+  console.log('\n🛑 SIGTERM received...');
+  try { await client.destroy(); } catch (e) {}
   process.exit(0);
 });
