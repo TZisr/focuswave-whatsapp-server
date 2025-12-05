@@ -7,10 +7,11 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "^6.7.16",
     "cors": "^2.8.5",
     "express": "^4.21.2",
-    "node-cache": "^5.1.2",
+    "link-preview-js": "^3.0.5",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4"
   },
