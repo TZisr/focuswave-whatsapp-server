@@ -1,0 +1,25 @@
+# Node.js LTS Alpine
+FROM node:20-alpine
+
+# Create app directory
+WORKDIR /app
+
+# Install dependencies first (better caching)
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# Copy source
+COPY index.js ./
+
+# Create auth directory
+RUN mkdir -p auth_state
+
+# Railway sets PORT automatically
+ENV NODE_ENV=production
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:${PORT:-3000}/health || exit 1
+
+CMD ["node", "index.js"]
