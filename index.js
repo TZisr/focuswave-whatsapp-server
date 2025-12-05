@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const QRCode = require('qrcode');
 const pino = require('pino');
+const { Boom } = require('@hapi/boom');
 const { 
   default: makeWASocket, 
   DisconnectReason, 
@@ -9,6 +10,7 @@ const {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
+const fs = require('fs');
 
 // ============ CONFIG ============
 const PORT = process.env.PORT || 3000;
@@ -20,57 +22,54 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // ============ LOGGER ============
-const logger = pino({ 
-  level: process.env.LOG_LEVEL || 'info',
-  transport: {
-    target: 'pino-pretty',
-    options: { colorize: true }
-  }
-}).child({ module: 'baileys' });
-
-// Silence baileys internal logs
-const baileysLogger = pino({ level: 'silent' });
+const logger = pino({ level: 'silent' });
 
 // ============ STATE ============
 let sock = null;
 let qrCode = null;
-let connectionStatus = 'disconnected';
+let connectionStatus = 'initializing';
 let userInfo = null;
 
 // ============ WHATSAPP CONNECTION ============
 async function connectWhatsApp() {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('🚀 Initializing WhatsApp connection...');
+  console.log('🚀 Starting WhatsApp connection...');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   
   connectionStatus = 'connecting';
   qrCode = null;
 
   try {
+    // Ensure auth folder exists
+    if (!fs.existsSync(AUTH_FOLDER)) {
+      fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+    }
+
     // Load auth state
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
     
     // Get latest WA version
-    const { version } = await fetchLatestBaileysVersion();
-    console.log(`📱 WhatsApp Web version: ${version.join('.')}`);
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(`📱 Using WA v${version.join('.')}, isLatest: ${isLatest}`);
 
-    // Create socket
+    // Create socket - minimal config following official docs
     sock = makeWASocket({
       version,
-      logger: baileysLogger,
+      logger,
       printQRInTerminal: true,
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, baileysLogger)
+        keys: makeCacheableSignalKeyStore(state.keys, logger)
       },
-      generateHighQualityLinkPreview: false,
-      syncFullHistory: false,
-      markOnlineOnConnect: false
+      browser: ['FocusWave', 'Chrome', '120.0.0'],
+      generateHighQualityLinkPreview: false
     });
 
     // ===== CONNECTION EVENTS =====
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
+      
+      console.log(`Connection update: ${JSON.stringify({ connection, hasQr: !!qr })}`);
       
       // QR Code received
       if (qr) {
@@ -97,30 +96,22 @@ async function connectWhatsApp() {
 
       // Connection closed
       if (connection === 'close') {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const reason = lastDisconnect?.error?.output?.payload?.message || 'Unknown';
+        const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         
-        console.log(`🔌 Disconnected: ${reason} (code: ${statusCode})`);
+        console.log(`🔌 Connection closed. Code: ${statusCode}, Reconnect: ${shouldReconnect}`);
+        
         connectionStatus = 'disconnected';
         qrCode = null;
         userInfo = null;
 
-        // Handle different disconnect reasons
         if (statusCode === DisconnectReason.loggedOut) {
           console.log('🚪 Logged out - clearing session...');
-          // Clear auth state
-          const fs = require('fs');
-          if (fs.existsSync(AUTH_FOLDER)) {
-            fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-          }
-          // Restart to get new QR
-          setTimeout(connectWhatsApp, 2000);
-        } else if (statusCode === DisconnectReason.restartRequired) {
-          console.log('🔄 Restart required...');
-          setTimeout(connectWhatsApp, 1000);
-        } else if (statusCode !== DisconnectReason.connectionClosed) {
-          // Auto-reconnect for other errors
-          console.log('🔄 Reconnecting in 3 seconds...');
+          clearAuthState();
+        }
+        
+        if (shouldReconnect) {
+          console.log('🔄 Reconnecting...');
           setTimeout(connectWhatsApp, 3000);
         }
       }
@@ -132,8 +123,18 @@ async function connectWhatsApp() {
   } catch (err) {
     console.error('❌ Connection error:', err.message);
     connectionStatus = 'error';
-    // Retry after error
     setTimeout(connectWhatsApp, 5000);
+  }
+}
+
+function clearAuthState() {
+  try {
+    if (fs.existsSync(AUTH_FOLDER)) {
+      fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+      console.log('🧹 Auth state cleared');
+    }
+  } catch (e) {
+    console.error('Failed to clear auth state:', e.message);
   }
 }
 
@@ -142,7 +143,7 @@ async function connectWhatsApp() {
 // Health check
 app.get('/health', (req, res) => {
   res.json({ 
-    status: 'running',
+    status: 'ok',
     connected: connectionStatus === 'connected',
     uptime: Math.floor(process.uptime())
   });
@@ -236,8 +237,9 @@ app.post('/restart', (req, res) => {
   }
   connectionStatus = 'disconnected';
   qrCode = null;
+  userInfo = null;
   setTimeout(connectWhatsApp, 500);
-  res.json({ success: true, message: 'Restarting...' });
+  res.json({ success: true, message: 'Restarting connection...' });
 });
 
 // ============ START SERVER ============
