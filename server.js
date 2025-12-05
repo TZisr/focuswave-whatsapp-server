@@ -3,18 +3,19 @@ const cors = require('cors');
 const QRCode = require('qrcode');
 const qrcodeTerminal = require('qrcode-terminal');
 const pino = require('pino');
+const fs = require('fs');
 const { 
   default: makeWASocket, 
   DisconnectReason, 
   useMultiFileAuthState,
-  fetchLatestBaileysVersion
+  makeCacheableSignalKeyStore,
+  Browsers
 } = require('@whiskeysockets/baileys');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Quieter logger for production
-const logger = pino({ level: 'warn' });
+const logger = pino({ level: 'silent' });
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
@@ -26,96 +27,133 @@ let isConnected = false;
 let isInitializing = true;
 let initError = null;
 let connectionInfo = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
 
-async function connectToWhatsApp() {
+// Clear corrupted session if needed
+function clearSession() {
+  const sessionPath = './whatsapp-session';
+  if (fs.existsSync(sessionPath)) {
+    console.log('🧹 Clearing old session...');
+    fs.rmSync(sessionPath, { recursive: true, force: true });
+  }
+}
+
+async function connectToWhatsApp(forceNew = false) {
   console.log('🚀 Starting WhatsApp connection...');
   isInitializing = true;
   initError = null;
   
+  if (forceNew) {
+    clearSession();
+    reconnectAttempts = 0;
+  }
+  
   try {
-    // Get auth state from file system
     const { state, saveCreds } = await useMultiFileAuthState('./whatsapp-session');
     
-    // Fetch latest version
-    const { version } = await fetchLatestBaileysVersion();
-    console.log(`📱 Using WA version: ${version.join('.')}`);
-    
-    // Create socket
     sock = makeWASocket({
-      version,
-      auth: state,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger)
+      },
       logger,
       printQRInTerminal: true,
-      browser: ['FocusWave', 'Chrome', '120.0.0'],
-      syncFullHistory: false
+      browser: Browsers.ubuntu('Chrome'),
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      keepAliveIntervalMs: 30000,
+      emitOwnEvents: false,
+      generateHighQualityLinkPreview: false,
+      syncFullHistory: false,
+      markOnlineOnConnect: false
     });
 
-    // Connection update handler
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
       
       if (qr) {
-        console.log('📱 QR Code generated');
+        console.log('📱 QR Code generated - scan with WhatsApp!');
         isInitializing = false;
+        reconnectAttempts = 0;
         try {
-          currentQR = await QRCode.toDataURL(qr, {
-            width: 256,
-            margin: 2
-          });
+          currentQR = await QRCode.toDataURL(qr, { width: 256, margin: 2 });
           qrcodeTerminal.generate(qr, { small: true });
         } catch (err) {
-          console.error('QR generation error:', err);
+          console.error('QR error:', err.message);
         }
       }
       
       if (connection === 'close') {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        
-        console.log('🔌 Connection closed. Status:', statusCode);
         isConnected = false;
         currentQR = null;
         
-        if (shouldReconnect) {
-          console.log('🔄 Reconnecting...');
-          setTimeout(connectToWhatsApp, 3000);
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const reason = DisconnectReason[statusCode] || statusCode;
+        console.log('🔌 Disconnected. Reason:', reason);
+        
+        // Handle different disconnect reasons
+        if (statusCode === DisconnectReason.loggedOut) {
+          console.log('👋 Logged out - clearing session');
+          clearSession();
+          setTimeout(() => connectToWhatsApp(true), 3000);
+        } else if (statusCode === DisconnectReason.badSession) {
+          console.log('❌ Bad session - clearing and retrying');
+          clearSession();
+          setTimeout(() => connectToWhatsApp(true), 3000);
+        } else if (statusCode === DisconnectReason.connectionClosed || 
+                   statusCode === DisconnectReason.connectionLost ||
+                   statusCode === DisconnectReason.timedOut ||
+                   statusCode === undefined) {
+          reconnectAttempts++;
+          if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+            console.log(`🔄 Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+            setTimeout(connectToWhatsApp, 3000 * reconnectAttempts);
+          } else {
+            console.log('❌ Max reconnect attempts reached, clearing session');
+            clearSession();
+            reconnectAttempts = 0;
+            setTimeout(() => connectToWhatsApp(true), 5000);
+          }
         } else {
-          console.log('👋 Logged out, not reconnecting');
-          initError = 'Logged out from WhatsApp';
+          console.log('🔄 Unknown disconnect, retrying...');
+          setTimeout(connectToWhatsApp, 5000);
         }
       } else if (connection === 'open') {
         console.log('✅ WhatsApp connected!');
         isConnected = true;
         isInitializing = false;
         currentQR = null;
+        reconnectAttempts = 0;
         
-        // Get connection info
         const user = sock.user;
         connectionInfo = {
           pushname: user?.name || 'Unknown',
           phone: user?.id?.split(':')[0] || 'Unknown'
         };
         console.log('📞 Connected as:', connectionInfo.pushname);
+      } else if (connection === 'connecting') {
+        console.log('⏳ Connecting...');
       }
     });
 
-    // Save credentials when updated
     sock.ev.on('creds.update', saveCreds);
-
-    console.log('✅ Socket created, waiting for connection...');
     
   } catch (err) {
-    console.error('❌ Failed to initialize:', err.message);
+    console.error('❌ Init error:', err.message);
     initError = err.message;
     isInitializing = false;
+    
+    // Clear session on init error and retry
+    clearSession();
+    setTimeout(() => connectToWhatsApp(true), 5000);
   }
 }
 
 // Start connection
-connectToWhatsApp();
+connectToWhatsApp(true); // Start fresh
 
 // Routes
-
 app.get('/status', (req, res) => {
   res.json({
     connected: isConnected,
@@ -133,16 +171,13 @@ app.get('/qr', (req, res) => {
   }
   
   if (initError) {
-    return res.status(500).json({ 
-      error: 'Initialization failed',
-      message: initError
-    });
+    return res.status(500).json({ error: 'Init failed', message: initError });
   }
   
   if (!currentQR) {
     return res.status(503).json({ 
       error: 'QR code not available yet',
-      message: isInitializing ? 'Starting up...' : 'Waiting for QR...',
+      message: isInitializing ? 'Starting...' : 'Waiting for QR...',
       initializing: isInitializing
     });
   }
@@ -152,107 +187,58 @@ app.get('/qr', (req, res) => {
 
 app.get('/chats', async (req, res) => {
   if (!isConnected || !sock) {
-    return res.status(503).json({ 
-      error: 'WhatsApp not connected',
-      message: 'Please scan the QR code first'
-    });
+    return res.status(503).json({ error: 'Not connected' });
   }
 
   try {
-    // Get all chats from store
-    const chats = await sock.groupFetchAllParticipating();
-    const chatList = Object.values(chats || {});
-    
-    // Get individual conversations too
-    const store = sock.store;
-    
-    const formattedChats = chatList.slice(0, 50).map(chat => ({
+    const groups = await sock.groupFetchAllParticipating();
+    const chats = Object.values(groups || {}).slice(0, 50).map(chat => ({
       id: chat.id,
-      name: chat.subject || chat.name || 'Unknown',
-      isGroup: chat.id.includes('@g.us'),
-      unreadCount: 0,
-      timestamp: chat.creation ? new Date(chat.creation * 1000).toISOString() : null,
+      name: chat.subject || 'Unknown',
+      isGroup: true,
       participants: chat.participants?.length || 0,
       messages: []
     }));
-
-    res.json({ chats: formattedChats });
+    res.json({ chats });
   } catch (err) {
-    console.error('Error fetching chats:', err);
-    res.status(500).json({ error: 'Failed to fetch chats', message: err.message });
-  }
-});
-
-app.get('/chats/:chatId/messages', async (req, res) => {
-  if (!isConnected || !sock) {
-    return res.status(503).json({ error: 'WhatsApp not connected' });
-  }
-
-  try {
-    const { chatId } = req.params;
-    const limit = parseInt(req.query.limit) || 50;
-    
-    // Fetch messages
-    const messages = await sock.fetchMessages(chatId, limit);
-    
-    res.json({
-      messages: (messages || []).map(msg => ({
-        id: msg.key.id,
-        body: msg.message?.conversation || 
-              msg.message?.extendedTextMessage?.text || 
-              '[Media]',
-        author: msg.key.participant || msg.key.remoteJid,
-        timestamp: new Date(msg.messageTimestamp * 1000).toISOString(),
-        fromMe: msg.key.fromMe,
-        type: Object.keys(msg.message || {})[0] || 'unknown'
-      }))
-    });
-  } catch (err) {
-    console.error('Error fetching messages:', err);
-    res.status(500).json({ error: 'Failed to fetch messages', message: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
 app.post('/disconnect', async (req, res) => {
   try {
-    if (sock) {
-      await sock.logout();
-    }
+    if (sock) await sock.logout();
+    clearSession();
     isConnected = false;
     currentQR = null;
-    res.json({ success: true, message: 'Disconnected' });
+    res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to disconnect', message: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    connected: isConnected,
-    initializing: isInitializing,
-    hasError: !!initError
-  });
+app.post('/reset', (req, res) => {
+  console.log('🔄 Manual reset requested');
+  clearSession();
+  isConnected = false;
+  currentQR = null;
+  reconnectAttempts = 0;
+  setTimeout(() => connectToWhatsApp(true), 1000);
+  res.json({ success: true, message: 'Resetting connection...' });
 });
 
-// Start server
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', connected: isConnected, initializing: isInitializing });
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║         FocusWave WhatsApp Server (Baileys)               ║
-╠═══════════════════════════════════════════════════════════╣
-║  Server running on port ${PORT}                              ║
-║  No Chromium required! 🎉                                 ║
+║  Port: ${PORT}                                               ║
 ╚═══════════════════════════════════════════════════════════╝
   `);
 });
 
-process.on('SIGINT', () => {
-  console.log('\n🛑 Shutting down...');
-  process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-  console.log('\n🛑 SIGTERM received...');
-  process.exit(0);
-});
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => process.exit(0));
