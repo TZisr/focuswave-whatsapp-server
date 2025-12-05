@@ -96,10 +96,11 @@ async function connectWhatsApp() {
 
       // Connection closed
       if (connection === 'close') {
-        const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        const error = lastDisconnect?.error;
+        const statusCode = error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         
-        console.log(`🔌 Connection closed. Code: ${statusCode}, Reconnect: ${shouldReconnect}`);
+        console.log(`🔌 Connection closed. Code: ${statusCode}, Error: ${error?.message || 'none'}, Reconnect: ${shouldReconnect}`);
         
         connectionStatus = 'disconnected';
         qrCode = null;
@@ -111,8 +112,8 @@ async function connectWhatsApp() {
         }
         
         if (shouldReconnect) {
-          console.log('🔄 Reconnecting...');
-          setTimeout(connectWhatsApp, 3000);
+          console.log('🔄 Reconnecting in 5s...');
+          setTimeout(connectWhatsApp, 5000);
         }
       }
     });
