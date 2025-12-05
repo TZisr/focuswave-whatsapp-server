@@ -4,7 +4,7 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 8080;
 
 // CORS - allow all origins (configure for production)
 app.use(cors({
@@ -18,7 +18,16 @@ app.use(express.json());
 // State
 let currentQR = null;
 let isConnected = false;
+let isInitializing = true;
+let initError = null;
 let clientInfo = null;
+
+// Get Chromium path from environment or use default
+const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || 
+                      process.env.CHROMIUM_PATH || 
+                      '/usr/bin/chromium';
+
+console.log('🌐 Using Chromium at:', CHROMIUM_PATH);
 
 // Initialize WhatsApp client with local session storage
 const client = new Client({
@@ -27,6 +36,7 @@ const client = new Client({
   }),
   puppeteer: {
     headless: true,
+    executablePath: CHROMIUM_PATH,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -34,7 +44,19 @@ const client = new Client({
       '--disable-accelerated-2d-canvas',
       '--no-first-run',
       '--no-zygote',
-      '--disable-gpu'
+      '--single-process',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-extensions',
+      '--disable-sync',
+      '--disable-translate',
+      '--hide-scrollbars',
+      '--metrics-recording-only',
+      '--mute-audio',
+      '--no-default-browser-check',
+      '--safebrowsing-disable-auto-update'
     ]
   }
 });
@@ -42,9 +64,17 @@ const client = new Client({
 // Event handlers
 client.on('qr', async (qr) => {
   console.log('📱 QR Code generated - scan with WhatsApp');
+  isInitializing = false;
   try {
     // Generate QR code as data URL for frontend display
-    currentQR = await QRCode.toDataURL(qr);
+    currentQR = await QRCode.toDataURL(qr, {
+      width: 256,
+      margin: 2,
+      color: {
+        dark: '#000000',
+        light: '#FFFFFF'
+      }
+    });
     console.log('✅ QR Code ready for scanning');
   } catch (err) {
     console.error('❌ QR generation error:', err);
@@ -55,17 +85,20 @@ client.on('qr', async (qr) => {
 client.on('authenticated', () => {
   console.log('🔐 Authentication successful');
   currentQR = null;
+  isInitializing = false;
 });
 
 client.on('auth_failure', (msg) => {
   console.error('❌ Authentication failed:', msg);
   isConnected = false;
   currentQR = null;
+  initError = 'Authentication failed: ' + msg;
 });
 
 client.on('ready', () => {
   console.log('✅ WhatsApp client is ready!');
   isConnected = true;
+  isInitializing = false;
   currentQR = null;
   clientInfo = client.info;
   console.log('📞 Connected as:', clientInfo?.pushname || 'Unknown');
@@ -75,27 +108,42 @@ client.on('disconnected', (reason) => {
   console.log('🔌 Client disconnected:', reason);
   isConnected = false;
   clientInfo = null;
+  // Try to reinitialize after disconnect
+  setTimeout(() => {
+    console.log('🔄 Attempting to reinitialize...');
+    client.initialize().catch(err => {
+      console.error('❌ Reinitialize failed:', err.message);
+    });
+  }, 5000);
 });
 
 client.on('loading_screen', (percent, message) => {
   console.log(`⏳ Loading: ${percent}% - ${message}`);
 });
 
-// Initialize client
+// Initialize client with better error handling
 console.log('🚀 Starting WhatsApp client...');
-client.initialize().catch(err => {
-  console.error('❌ Failed to initialize client:', err);
-});
+client.initialize()
+  .then(() => {
+    console.log('✅ Client initialized successfully');
+  })
+  .catch(err => {
+    console.error('❌ Failed to initialize client:', err.message);
+    initError = err.message;
+    isInitializing = false;
+  });
 
 // Routes
 
 // GET /status - Connection status
 app.get('/status', (req, res) => {
-  console.log('📡 Status check - connected:', isConnected);
+  console.log('📡 Status check - connected:', isConnected, 'initializing:', isInitializing);
   res.json({
     connected: isConnected,
     authenticated: isConnected,
     scanning: !isConnected && currentQR !== null,
+    initializing: isInitializing,
+    error: initError,
     info: isConnected ? {
       pushname: clientInfo?.pushname,
       phone: clientInfo?.wid?.user
@@ -105,16 +153,27 @@ app.get('/status', (req, res) => {
 
 // GET /qr - Get QR code for scanning
 app.get('/qr', (req, res) => {
+  console.log('📱 QR requested - connected:', isConnected, 'hasQR:', !!currentQR, 'initializing:', isInitializing);
+  
   if (isConnected) {
-    console.log('📱 QR requested but already connected');
+    console.log('📱 Already connected');
     return res.json({ connected: true, qr: null });
   }
   
+  if (initError) {
+    console.log('📱 Init error:', initError);
+    return res.status(500).json({ 
+      error: 'Client initialization failed',
+      message: initError
+    });
+  }
+  
   if (!currentQR) {
-    console.log('📱 QR not ready yet');
+    console.log('📱 QR not ready yet, initializing:', isInitializing);
     return res.status(503).json({ 
       error: 'QR code not available yet',
-      message: 'Please wait for the QR code to be generated'
+      message: isInitializing ? 'WhatsApp client is starting up...' : 'Please wait for the QR code to be generated',
+      initializing: isInitializing
     });
   }
   
@@ -223,21 +282,28 @@ app.post('/disconnect', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', connected: isConnected });
+  res.json({ 
+    status: 'ok', 
+    connected: isConnected,
+    initializing: isInitializing,
+    hasError: !!initError
+  });
 });
 
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║         FocusWave WhatsApp Server                         ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  Server running on port ${PORT}                              ║
+║  Chromium: ${CHROMIUM_PATH.substring(0, 40).padEnd(40)}   ║
 ║  Endpoints:                                               ║
 ║    GET  /status  - Connection status                      ║
 ║    GET  /qr      - QR code for scanning                   ║
 ║    GET  /chats   - All chats with messages                ║
 ║    POST /disconnect - Logout                              ║
+║    GET  /health  - Health check                           ║
 ╚═══════════════════════════════════════════════════════════╝
   `);
 });
@@ -245,6 +311,16 @@ app.listen(PORT, () => {
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\n🛑 Shutting down gracefully...');
+  try {
+    await client.destroy();
+  } catch (err) {
+    console.error('Error during shutdown:', err);
+  }
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('\n🛑 SIGTERM received, shutting down...');
   try {
     await client.destroy();
   } catch (err) {
